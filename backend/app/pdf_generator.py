@@ -136,10 +136,126 @@ def generate_rent_receipt(
     pdf.cell(0, 5, "Signature du bailleur :", new_x="LMARGIN", new_y="NEXT")
 
     if signature_png_bytes:
-        # Embed the decrypted signature image. fpdf2 reads the bytes from the
-        # BytesIO and discards them after rendering — nothing is persisted.
+        # Local import — Pillow is already a dependency, used here only to
+        # measure the embedded signature so the watermark area matches it.
+        from PIL import Image
+
         x = pdf.l_margin
         y = pdf.get_y() + 2
-        pdf.image(BytesIO(signature_png_bytes), x=x, y=y, h=20)
+        sig_h = 20  # mm
+        pdf.image(BytesIO(signature_png_bytes), x=x, y=y, h=sig_h)
+
+        # Compute the signature's rendered width in mm so the watermark
+        # exactly overlays it (fpdf2 preserves aspect ratio when only `h`
+        # is given).
+        with Image.open(BytesIO(signature_png_bytes)) as img:
+            sig_w = sig_h * (img.width / max(1, img.height))
+
+        # Watermark drawn at PDF level (not on the PNG) so it stays legible
+        # regardless of how small the underlying signature is. Diagonal red
+        # text centered on the signature box, sized to fit the rendered text
+        # rather than the signature dimensions — narrow signatures still get
+        # a fully readable watermark across them.
+        _draw_signature_watermark(
+            pdf,
+            text=f"{MONTHS_FR[month].upper()} {year}\n{now_paris}",
+            sig_x=x, sig_y=y, sig_height=sig_h, sig_width=sig_w,
+        )
 
     return bytes(pdf.output())
+
+
+_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+)
+
+# Opacity of the rendered watermark text. Range 0..255. 60 ≈ 23% alpha.
+_WATERMARK_ALPHA = 60
+
+
+def _load_watermark_font(size: int):
+    """Return a TTF font that supports French accents. Falls back to Pillow's
+    bundled default font if no DejaVu install is found (e.g. tests outside
+    the container)."""
+    import os
+    from PIL import ImageFont
+    for path in _FONT_CANDIDATES:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _draw_signature_watermark(
+    pdf: FPDF, *, text: str, sig_x: float, sig_y: float,
+    sig_height: float, sig_width: float,
+) -> None:
+    """Overlay a semi-transparent rotated watermark centered on the signature
+    box. The watermark canvas is sized to fit the rotated text (not the
+    signature) so narrow signatures still get a fully readable stamp across
+    them; the canvas is then clamped to the printable page area.
+
+    fpdf2 2.8.1 has no text-level alpha API, so the watermark is rendered
+    as a transparent PNG via Pillow and embedded as an image (fpdf2 honours
+    the PNG alpha channel).
+    """
+    from PIL import Image, ImageDraw
+
+    dpi = 300
+    px_per_mm = dpi / 25.4
+
+    # Font size in pixels — anchored to the signature *height* so the text
+    # looks consistent across receipts regardless of signature aspect ratio.
+    # Smaller than a single-line layout because the watermark is now stacked
+    # on two lines ("MOIS YYYY" + "DD/MM/YYYY").
+    fontsize = max(24, int(sig_height * px_per_mm * 0.24))
+    font = _load_watermark_font(fontsize)
+    line_spacing = max(2, fontsize // 6)
+
+    # Render the (possibly multi-line) text on its own transparent layer,
+    # then rotate. The rotated tight bbox determines the watermark canvas
+    # size. multiline_text + align="center" handles the line break in `text`.
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    bbox = measure.multiline_textbbox(
+        (0, 0), text, font=font, spacing=line_spacing, align="center",
+    )
+    tw = int(round(bbox[2] - bbox[0]))
+    th = int(round(bbox[3] - bbox[1]))
+    pad = max(8, fontsize // 4)
+    text_layer = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
+    ImageDraw.Draw(text_layer).multiline_text(
+        (pad, pad), text, font=font,
+        fill=(190, 0, 0, _WATERMARK_ALPHA),
+        spacing=line_spacing, align="center",
+    )
+    rotated = text_layer.rotate(-20, expand=True, resample=Image.BICUBIC)
+    rw, rh = rotated.size
+
+    # Canvas matches the rotated text exactly.
+    canvas = Image.new("RGBA", (rw, rh), (0, 0, 0, 0))
+    canvas.alpha_composite(rotated, (0, 0))
+
+    canvas_w_mm = rw / px_per_mm
+    canvas_h_mm = rh / px_per_mm
+
+    # Center the canvas on the signature center, then clamp to printable
+    # area so the watermark never gets clipped by the page margins.
+    sig_cx = sig_x + sig_width / 2
+    sig_cy = sig_y + sig_height / 2
+    x = sig_cx - canvas_w_mm / 2
+    y = sig_cy - canvas_h_mm / 2
+
+    usable_left = pdf.l_margin
+    usable_right = pdf.w - pdf.r_margin
+    if x < usable_left:
+        x = usable_left
+    if x + canvas_w_mm > usable_right:
+        x = max(usable_left, usable_right - canvas_w_mm)
+
+    buf = BytesIO()
+    canvas.save(buf, format="PNG")
+    pdf.image(BytesIO(buf.getvalue()), x=x, y=y, w=canvas_w_mm, h=canvas_h_mm)
