@@ -1,4 +1,4 @@
-# Rental — Rental Property Management
+# Rental — Rental Property Management FR
 
 Self-hosted web app to manage rental properties, tenants, leases, monthly
 payments, charges regularization and PDF rent receipts. Multi-user with
