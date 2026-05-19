@@ -1,0 +1,70 @@
+# Two internal networks:
+#   - backend: db <-> backend only (db not exposed anywhere else)
+#   - frontend: backend <-> nginx; nginx is the single ingress
+# The frontend container binds 8080 on the host by default — put a TLS-
+# terminating reverse proxy in front of it before exposing it publicly.
+
+networks:
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  rental_db_data:
+
+services:
+
+  rental-db:
+    image: postgres:16-alpine
+    container_name: rental-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rental
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
+      POSTGRES_DB: rental
+      TZ: ${TZ:-UTC}
+      PGTZ: ${TZ:-UTC}
+    volumes:
+      - rental_db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rental -d rental"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rental-backend:
+    build: ./backend
+    image: rental-backend
+    container_name: rental-backend
+    restart: unless-stopped
+    depends_on:
+      rental-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://rental:${POSTGRES_PASSWORD}@rental-db:5432/rental
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required — see .env.example}
+      SIGNATURE_ENCRYPTION_KEY: ${SIGNATURE_ENCRYPTION_KEY:?SIGNATURE_ENCRYPTION_KEY is required — see .env.example}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - backend
+      - frontend
+
+  rental-frontend:
+    build: ./frontend
+    image: rental-frontend
+    container_name: rental-frontend
+    restart: unless-stopped
+    depends_on:
+      - rental-backend
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${HOST_PORT:-8080}:80"
+    networks:
+      - frontend
