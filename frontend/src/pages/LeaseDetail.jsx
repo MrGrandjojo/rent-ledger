@@ -192,31 +192,48 @@ export default function LeaseDetail() {
   const irl = lease.next_irl_revision_date ? new Date(lease.next_irl_revision_date) : null
   const irlAlert = irl && (irl - today) / 86400000 <= 30 && (irl - today) / 86400000 >= 0
 
-  // Total dû — sum of outstanding_balance for every unpaid/partial payment
-  // of this lease across all months. Computed client-side from the
-  // already-loaded payments list so we don't need a new endpoint.
-  const debtPayments = payments.filter(
-    (p) => (p.status === 'unpaid' || p.status === 'partial')
-            && Number(p.outstanding_balance) > 0
+  // Total dû — mirrors the dashboard's "Net outstanding" formula
+  // (ARCHITECTURE.md "Net outstanding (all-months)"): max(0, Σexpected − Σreceived)
+  // across every Payment row, plus the current month projected as unpaid if
+  // no row exists for it (active leases only). Net of overpayments — surplus
+  // on month M cancels arrears on earlier months, which a naive sum of
+  // per-row `outstanding_balance` would not do (the per-row column clamps
+  // at 0 by design).
+  const currentYear = today.getFullYear()
+  const currentMonth = today.getMonth() + 1
+  const hasCurrentMonthPayment = payments.some(
+    (p) => p.year === currentYear && p.month === currentMonth,
   )
-  const totalDue = debtPayments.reduce(
-    (acc, p) => acc + Number(p.outstanding_balance),
-    0,
-  )
-  const debtMonthsCount = debtPayments.length
+  const currentMonthExpected = Number(lease.current_monthly_rent ?? 0)
+                             + Number(lease.current_monthly_charges ?? 0)
+  const projectCurrentMonth = lease.is_active
+                            && !hasCurrentMonthPayment
+                            && currentMonthExpected > 0
+  const sumExpected = payments.reduce((acc, p) => acc + Number(p.expected_amount || 0), 0)
+                    + (projectCurrentMonth ? currentMonthExpected : 0)
+  const sumReceived = payments.reduce((acc, p) => acc + Number(p.received_amount || 0), 0)
+  const totalDue = Math.max(0, sumExpected - sumReceived)
+  let debtMonthsCount = payments.filter((p) => Number(p.outstanding_balance) > 0).length
+  if (projectCurrentMonth) debtMonthsCount += 1
 
-  // Payments sorted ASC for the history table + running cumulative
-  // outstanding balance per row (the value AS OF that row, oldest first).
-  // The cumulative is computed across the FULL history so the figure
-  // remains meaningful even when the year filter narrows the visible rows.
+  // Payments sorted ASC for the history table + running cumulative net
+  // outstanding (oldest first). Formula matches the dashboard's "Total dû"
+  // (ARCHITECTURE.md "Net outstanding"): max(0, Σexpected − Σreceived) cumulated
+  // across the full history, so an overpayment in one month reduces the
+  // displayed cumulative against earlier arrears.
   const paymentsAsc = [...payments].sort((a, b) => {
     if (a.year !== b.year) return a.year - b.year
     return a.month - b.month
   })
-  let runningCumulative = 0
+  let runningExpected = 0
+  let runningReceived = 0
   const paymentsWithCumAll = paymentsAsc.map((p) => {
-    runningCumulative += Number(p.outstanding_balance || 0)
-    return { ...p, cumulative_outstanding: runningCumulative }
+    runningExpected += Number(p.expected_amount || 0)
+    runningReceived += Number(p.received_amount || 0)
+    return {
+      ...p,
+      cumulative_outstanding: Math.max(0, runningExpected - runningReceived),
+    }
   })
 
   // Years present in this lease's payment history.
@@ -255,7 +272,8 @@ export default function LeaseDetail() {
               {fmtCurrency(totalDue)}
             </p>
             <p className="text-xs text-gray-500 mt-1">
-              Cumul des soldes dus sur l'ensemble des paiements (impayés ou partiels) de ce bail.
+              Solde net sur l'ensemble du bail : Σ attendu − Σ reçu, incluant le mois courant
+              projeté si non encore enregistré. Les trop-perçus compensent les arriérés.
             </p>
           </div>
           <div className="text-right">
@@ -286,16 +304,29 @@ export default function LeaseDetail() {
           <div className="grid grid-cols-2 gap-2 text-sm">
             <span className="text-gray-500">Loyer HC</span><span className="font-medium">{fmtCurrency(lease.initial_monthly_rent ?? 0)}</span>
             <span className="text-gray-500">Provisions charges</span><span className="font-medium">{fmtCurrency(lease.initial_monthly_charges ?? 0)}</span>
-            <span className="text-gray-500">Total CC</span><span className="font-semibold text-blue-700">{fmtCurrency(lease.initial_monthly_total ?? 0)}</span>
+            {/* When a revision is in effect, the initial Total CC is shown
+                neutral (it's the historical reference, not the current
+                figure); the blue/bold emphasis moves to "Loyer CC actuel".
+                Without a revision, Total CC keeps the emphasis. */}
+            <span className="text-gray-500">Total CC</span>
+            <span className={
+              (lease.current_monthly_total != null
+                && Number(lease.current_monthly_total) !== Number(lease.initial_monthly_total))
+                ? "font-semibold"
+                : "font-semibold text-blue-700"
+            }>
+              {fmtCurrency(lease.initial_monthly_total ?? 0)}
+            </span>
+            {lease.current_monthly_total != null && Number(lease.current_monthly_total) !== Number(lease.initial_monthly_total) && <>
+              <span className="text-gray-500">
+                Loyer CC actuel <span className="text-xs text-gray-400">(révisé)</span>
+              </span>
+              <span className="font-semibold text-blue-700">{fmtCurrency(lease.current_monthly_total)}</span>
+            </>}
             {lease.security_deposit_amount && <>
               <span className="text-gray-500">Dépôt de garantie</span><span>{fmtCurrency(lease.security_deposit_amount)}</span>
             </>}
           </div>
-          {lease.current_monthly_total != null && Number(lease.current_monthly_total) !== Number(lease.initial_monthly_total) && (
-            <p className="text-xs text-blue-700 font-medium">
-              Loyer CC actuel : {fmtCurrency(lease.current_monthly_total)} (révisé)
-            </p>
-          )}
           <p className="text-xs text-gray-400">
             Ces valeurs proviennent de la révision "Initiale" — modifier le bail les met à jour partout.
           </p>

@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from ..audit_log import log_event, snapshot_row
 from ..config import settings
 from ..database import get_db
 from ..dependencies import (
@@ -15,6 +16,8 @@ from ..schemas import DocumentOut
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 ALLOWED_TYPES = {"rent_receipt", "lease_scan", "other"}
+
+_DOCUMENT_FIELDS = ["id", "lease_id", "type", "file_name", "stored_path"]
 
 
 def _doc_visible(db: Session, user: User, doc: Document) -> bool:
@@ -70,6 +73,11 @@ async def upload_document(
     db.add(doc)
     db.commit()
     db.refresh(doc)
+    log_event(
+        db, user, action="create", entity_type="document",
+        entity_id=str(doc.id), entity_label=doc.file_name,
+        after=snapshot_row(doc, _DOCUMENT_FIELDS),
+    )
     return doc
 
 
@@ -89,8 +97,14 @@ def delete_document(doc_id: int, db: Session = Depends(get_db), user: User = Dep
     doc = db.get(Document, doc_id)
     if not doc or not _doc_visible(db, user, doc):
         raise HTTPException(404, "Document introuvable")
+    before = snapshot_row(doc, _DOCUMENT_FIELDS)
+    label = doc.file_name
     path = os.path.join(settings.upload_dir, doc.stored_path)
     if os.path.exists(path):
         os.remove(path)
     db.delete(doc)
     db.commit()
+    log_event(
+        db, user, action="delete", entity_type="document",
+        entity_id=str(doc_id), entity_label=label, before=before,
+    )

@@ -8,6 +8,7 @@ touched by the filesystem.
 
 import os
 import re
+import unicodedata
 import uuid
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,7 +27,12 @@ router = APIRouter(prefix="/api/receipts", tags=["receipts"])
 
 
 def _slug(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9]+", "-", s or "").strip("-").lower() or "locataire"
+    # Transliterate accents to ASCII (é → e, è → e, ç → c, …) before
+    # slugifying — otherwise a name like "LEFÈVRE" would become "lef-vre"
+    # with the È dropped and the surrounding hyphens left behind.
+    normalized = unicodedata.normalize("NFKD", s or "")
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-zA-Z0-9]+", "-", ascii_only).strip("-").lower() or "locataire"
 
 
 @router.post("/generate/{lease_id}")
@@ -55,7 +61,7 @@ def generate_receipt(
 
     property_address = (
         f"{property_.address_street}, {property_.address_zip} {property_.address_city}"
-        if property_ else "—"
+        if property_ else "[Adresse manquante]"
     )
 
     # Rent/charges as of the revision in effect for the receipt period.

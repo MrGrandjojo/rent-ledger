@@ -83,10 +83,20 @@ def update_tenant(tenant_id: int, body: TenantUpdate, db: Session = Depends(get_
     tenant = db.get(Tenant, tenant_id)
     if not tenant or not _tenant_visible_to(db, user, tenant_id):
         raise HTTPException(404, "Locataire introuvable")
+    before = snapshot_row(tenant, _TENANT_FIELDS)
     for k, v in body.model_dump().items():
         setattr(tenant, k, v)
     db.commit()
     db.refresh(tenant)
+    after = snapshot_row(tenant, _TENANT_FIELDS)
+    diff_before = {k: v for k, v in before.items() if before.get(k) != after.get(k)}
+    if diff_before:
+        log_event(
+            db, user, action="update", entity_type="tenant",
+            entity_id=str(tenant.id), entity_label=_tenant_label(tenant),
+            before=diff_before,
+            after={k: after.get(k) for k in diff_before},
+        )
     return tenant
 
 

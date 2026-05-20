@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from .database import SessionLocal, engine, seed_initial_users
 from .rate_limit import limiter
+from .request_context import ClientIPMiddleware
 from .routers import (
     admin, audit_logs, auth, charges, dashboard, documents, leases,
     payments, profile, properties, receipts, revisions, tenants,
@@ -73,6 +74,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # No CORS middleware — the SPA and API are served from the same origin via
 # the nginx front. If you split the deployment, add CORSMiddleware here with
 # an explicit allow_origins list (never "*" with credentials).
+
+# Populate a ContextVar with the caller's IP so `audit_log.log_event` can
+# record it on every CRUD action without each router having to thread a
+# `Request` through. Reads the first hop of `X-Forwarded-For` when a reverse
+# proxy sets it, otherwise the direct peer address.
+app.add_middleware(ClientIPMiddleware)
 
 app.include_router(auth.router)
 app.include_router(profile.router)

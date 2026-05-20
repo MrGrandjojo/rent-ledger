@@ -14,6 +14,7 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from .models import AuditLog, User
+from .request_context import current_client_ip
 
 
 ALLOWED_ACTIONS = (
@@ -66,7 +67,7 @@ def log_event(
         entity_label=entity_label,
         before=before,
         after=after,
-        ip_address=ip_address,
+        ip_address=ip_address if ip_address is not None else current_client_ip(),
     )
     db.add(entry)
     db.commit()

@@ -66,7 +66,7 @@ def generate_rent_receipt(
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 6, "BAILLEUR", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 5, landlord_name or "—", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, landlord_name or "[Bailleur]", new_x="LMARGIN", new_y="NEXT")
     if landlord_address:
         for line in landlord_address.splitlines():
             pdf.cell(0, 5, line, new_x="LMARGIN", new_y="NEXT")
