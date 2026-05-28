@@ -157,6 +157,60 @@ def current_effective_revision(db: Session, lease_id: int, today: date) -> Optio
     return effective_revision_for(db, lease_id, today.year, today.month)
 
 
+def batch_effective_revisions(
+    db: Session, lease_ids: list[int], target_date: date,
+) -> dict[int, RentRevision]:
+    """Return `{lease_id: RentRevision}` mapping each lease to the
+    revision in effect at `target_date` (largest effective_from ≤ target).
+
+    Single round-trip — used by hot paths (dashboard, leases list) where
+    calling `effective_revision_for` per lease would cause an N+1 storm at
+    PME scale (1000 baux → 1000 queries per page load)."""
+    if not lease_ids:
+        return {}
+    rows = (
+        db.query(RentRevision)
+        .filter(
+            RentRevision.lease_id.in_(lease_ids),
+            RentRevision.effective_from <= target_date,
+        )
+        .order_by(RentRevision.lease_id, RentRevision.effective_from.desc())
+        .all()
+    )
+    result: dict[int, RentRevision] = {}
+    for r in rows:
+        # First row per lease_id wins thanks to the descending order.
+        if r.lease_id not in result:
+            result[r.lease_id] = r
+    return result
+
+
+def batch_initial_revisions(
+    db: Session, lease_ids: list[int],
+) -> dict[int, RentRevision]:
+    """Return `{lease_id: RentRevision}` for the initial revision of each
+    lease. Same purpose as `batch_effective_revisions` — kills the N+1 in
+    the leases list endpoint."""
+    if not lease_ids:
+        return {}
+    rows = (
+        db.query(RentRevision)
+        .filter(RentRevision.lease_id.in_(lease_ids))
+        .order_by(
+            RentRevision.lease_id,
+            # 'initial' rows first, then chronological fallback.
+            (RentRevision.reason == "initial").desc(),
+            RentRevision.effective_from.asc(),
+        )
+        .all()
+    )
+    result: dict[int, RentRevision] = {}
+    for r in rows:
+        if r.lease_id not in result:
+            result[r.lease_id] = r
+    return result
+
+
 def upsert_initial_revision(
     db: Session, lease_id: int, start_date: date,
     monthly_rent: Decimal, monthly_charges: Decimal,

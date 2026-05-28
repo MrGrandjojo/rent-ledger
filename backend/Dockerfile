@@ -21,5 +21,13 @@ RUN groupadd --gid 1000 app && \
 USER app
 
 ENV PYTHONUNBUFFERED=1
+# Worker count is read at startup. Default 4 — comfortable for a small team
+# on a single host. Override at run-time with `-e UVICORN_WORKERS=N` if you
+# need to scale up or pin to a single worker for development.
+ENV UVICORN_WORKERS=4
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so ${UVICORN_WORKERS} expands at container start. The scheduler
+# (monthly payment generation, procedure status refresh, audit partition
+# maintenance) runs in exactly one worker thanks to an fcntl file lock —
+# see app/scheduler.py.
+CMD uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS}

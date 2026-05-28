@@ -9,7 +9,8 @@ from ..dependencies import (
     get_current_user,
 )
 from ..lease_rules import (
-    compute_end_date, compute_next_irl_revision, compute_renewed_end_date,
+    batch_effective_revisions, batch_initial_revisions, compute_end_date,
+    compute_next_irl_revision, compute_renewed_end_date,
     current_effective_revision, initial_revision_for, is_amendment,
     notice_period_alert, resolve_end_date, upsert_initial_revision,
 )
@@ -122,6 +123,119 @@ def _validate_amendment(body: LeaseCreate | LeaseUpdate, db: Session, self_id: i
     return parent
 
 
+def _enrich_all(leases: list[Lease], db: Session) -> list[dict]:
+    """Batched version of `_enrich(..., include_property_tenant=True)` for
+    the list endpoint. Replaces the N+1 storm (5-7 sub-queries per lease)
+    with 6 batched queries total — critical at PME scale (1000 baux)."""
+    if not leases:
+        return []
+    today = date.today()
+    lease_ids = [l.id for l in leases]
+
+    # All related entities in 5 batched queries.
+    revs_now = batch_effective_revisions(db, lease_ids, today)
+    revs_initial = batch_initial_revisions(db, lease_ids)
+
+    property_ids = list({l.property_id for l in leases})
+    properties_by_id = {
+        p.id: p for p in db.query(Property).filter(Property.id.in_(property_ids)).all()
+    }
+    tenant_ids = list({l.tenant_id for l in leases})
+    tenants_by_id = {
+        t.id: t for t in db.query(Tenant).filter(Tenant.id.in_(tenant_ids)).all()
+    }
+    parent_ids = list({l.parent_lease_id for l in leases if l.parent_lease_id})
+    parents_by_id = (
+        {p.id: p for p in db.query(Lease).filter(Lease.id.in_(parent_ids)).all()}
+        if parent_ids else {}
+    )
+    # All children of any lease in the list — used to render the amendments
+    # block on parent leases.
+    children_rows = (
+        db.query(Lease).filter(Lease.parent_lease_id.in_(lease_ids))
+        .order_by(Lease.start_date.asc()).all()
+    )
+    children_by_parent: dict[int, list[Lease]] = {}
+    for c in children_rows:
+        children_by_parent.setdefault(c.parent_lease_id, []).append(c)
+
+    # For summary rendering of parents/children we may need *their* current
+    # revision + tenant too — include them in the pre-loaded maps.
+    extra_lease_ids = (
+        {p.id for p in parents_by_id.values()}
+        | {c.id for c in children_rows}
+    ) - set(lease_ids)
+    if extra_lease_ids:
+        extra_revs = batch_effective_revisions(db, list(extra_lease_ids), today)
+        revs_now = {**revs_now, **extra_revs}
+        extra_tenant_ids = list(
+            {p.tenant_id for p in parents_by_id.values()}
+            | {c.tenant_id for c in children_rows}
+        ) - set(tenant_ids)
+        if extra_tenant_ids:
+            for t in db.query(Tenant).filter(Tenant.id.in_(extra_tenant_ids)).all():
+                tenants_by_id[t.id] = t
+
+    def _summary_batched(lease: Lease) -> LeaseSummary:
+        tenant = tenants_by_id.get(lease.tenant_id)
+        cur = revs_now.get(lease.id)
+        total = (
+            Decimal(cur.monthly_rent) + Decimal(cur.monthly_charges)
+            if cur else None
+        )
+        # Amendments inherit end_date from parent (single-level nesting).
+        end_date = lease.end_date
+        if is_amendment(lease):
+            parent = parents_by_id.get(lease.parent_lease_id)
+            if parent is not None:
+                end_date = parent.end_date
+        return LeaseSummary(
+            id=lease.id,
+            tenant_first_name=tenant.first_name if tenant else "",
+            tenant_last_name=tenant.last_name if tenant else "",
+            start_date=lease.start_date,
+            end_date=end_date,
+            current_monthly_total=total,
+            is_active=lease.is_active,
+        )
+
+    out: list[dict] = []
+    for l in leases:
+        d = {c.name: getattr(l, c.name) for c in l.__table__.columns}
+        d["is_amendment"] = is_amendment(l)
+        # End date resolution (amendments → parent.end_date, single hop).
+        if is_amendment(l):
+            parent = parents_by_id.get(l.parent_lease_id)
+            d["end_date"] = parent.end_date if parent else l.end_date
+        else:
+            d["end_date"] = l.end_date
+        d["next_irl_revision_date"] = compute_next_irl_revision(l.start_date, today)
+        d["notice_period_open"] = notice_period_alert(l, d["end_date"], today)
+
+        initial = revs_initial.get(l.id)
+        if initial is not None:
+            d["initial_monthly_rent"] = Decimal(initial.monthly_rent)
+            d["initial_monthly_charges"] = Decimal(initial.monthly_charges)
+            d["initial_monthly_total"] = (
+                Decimal(initial.monthly_rent) + Decimal(initial.monthly_charges)
+            )
+        current = revs_now.get(l.id)
+        if current is not None:
+            d["current_monthly_rent"] = Decimal(current.monthly_rent)
+            d["current_monthly_charges"] = Decimal(current.monthly_charges)
+            d["current_monthly_total"] = (
+                Decimal(current.monthly_rent) + Decimal(current.monthly_charges)
+            )
+
+        d["property"] = properties_by_id.get(l.property_id)
+        d["tenant"] = tenants_by_id.get(l.tenant_id)
+        parent = parents_by_id.get(l.parent_lease_id) if l.parent_lease_id else None
+        d["parent_lease"] = _summary_batched(parent) if parent else None
+        d["amendments"] = [_summary_batched(c) for c in children_by_parent.get(l.id, [])]
+        out.append(d)
+    return out
+
+
 @router.get("", response_model=list[LeaseDetailOut])
 def list_leases(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     q = db.query(Lease)
@@ -131,9 +245,23 @@ def list_leases(db: Session = Depends(get_db), user: User = Depends(get_current_
             return []
         q = q.filter(Lease.property_id.in_(ids))
     leases = q.order_by(Lease.start_date.desc()).all()
+    # Batch tacit renewal — collect updates then commit once instead of
+    # one commit per lease.
+    today = date.today()
+    dirty = False
     for l in leases:
-        _apply_tacit_renewal(l, db)
-    return [_enrich(l, db, include_property_tenant=True) for l in leases]
+        if is_amendment(l):
+            continue
+        if l.is_active and l.end_date and today > l.end_date:
+            new_end = compute_renewed_end_date(
+                l.start_date, l.lease_type, l.end_date, today
+            )
+            if new_end != l.end_date:
+                l.end_date = new_end
+                dirty = True
+    if dirty:
+        db.commit()
+    return _enrich_all(leases, db)
 
 
 @router.post("", response_model=LeaseDetailOut, status_code=201)

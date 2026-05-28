@@ -315,6 +315,18 @@ class PaymentUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class PaginatedPaymentsOut(BaseModel):
+    """Paginated envelope for GET /api/payments.
+
+    `total` is the total number of rows that match the filters (not the
+    page slice), so the frontend can render an accurate pagination bar
+    without a second count request."""
+    items: list["PaymentOut"]
+    total: int
+    page: int
+    page_size: int
+
+
 class PaymentOut(BaseModel):
     id: int
     lease_id: int
@@ -328,6 +340,9 @@ class PaymentOut(BaseModel):
     notes: Optional[str]
     created_at: Optional[datetime] = None
     model_config = {"from_attributes": True}
+
+
+PaginatedPaymentsOut.model_rebuild()
 
 
 class ExpectedAmountOut(BaseModel):
@@ -379,6 +394,85 @@ class DocumentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Procedure ─────────────────────────────────────────────────────────────────
+
+PROCEDURE_TYPES = ("commandement_payer",)
+PROCEDURE_STATUSES = ("in_progress", "paid", "expired_unpaid", "cancelled")
+
+
+class ProcedureCreate(BaseModel):
+    lease_id: int
+    parent_procedure_id: Optional[int] = None
+    procedure_type: str = "commandement_payer"
+    notification_date: date
+    # Optional — when omitted, server fills with notification_date + 2 months
+    # for procedure_type='commandement_payer'.
+    deadline_date: Optional[date] = None
+    amount_rent: Decimal = Decimal("0")
+    amount_fees: Decimal = Decimal("0")
+    amount_other: Decimal = Decimal("0")
+    bailiff_name: Optional[str] = None
+    act_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("procedure_type")
+    @classmethod
+    def _ptype(cls, v):
+        if v not in PROCEDURE_TYPES:
+            raise ValueError(f"procedure_type must be one of {PROCEDURE_TYPES}")
+        return v
+
+
+class ProcedureUpdate(BaseModel):
+    notification_date: Optional[date] = None
+    deadline_date: Optional[date] = None
+    amount_rent: Optional[Decimal] = None
+    amount_fees: Optional[Decimal] = None
+    amount_other: Optional[Decimal] = None
+    bailiff_name: Optional[str] = None
+    act_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ProcedureAttachedPayment(BaseModel):
+    """A payment counted toward a procedure, with the source of the link."""
+    payment: PaymentOut
+    source: str  # 'auto' (date window) or 'manual' (explicit attach)
+
+
+class ProcedureOut(BaseModel):
+    id: int
+    lease_id: int
+    parent_procedure_id: Optional[int] = None
+    procedure_type: str
+    notification_date: date
+    deadline_date: date
+    amount_rent: Decimal
+    amount_fees: Decimal
+    amount_other: Decimal
+    status: str  # recomputed at read time, never trusted from the row
+    bailiff_name: Optional[str] = None
+    act_reference: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Derived
+    total_due: Decimal = Decimal("0")
+    total_paid: Decimal = Decimal("0")
+    remaining_due: Decimal = Decimal("0")
+    days_remaining: Optional[int] = None  # negative if past deadline
+    attached_payments_count: int = 0
+    model_config = {"from_attributes": True}
+
+
+class ProcedureDetailOut(ProcedureOut):
+    attached_payments: list[ProcedureAttachedPayment] = []
+
+
+class ProcedurePaymentAttach(BaseModel):
+    payment_id: int
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 class DashboardStats(BaseModel):
@@ -399,6 +493,10 @@ class DashboardStats(BaseModel):
     # Older clients still read this field; new UI reads the two named
     # fields above.
     total_outstanding: Decimal = Decimal("0")
+    # Procedures (commandement de payer) overview.
+    cdp_active_count: int = 0       # status=in_progress, all deadlines
+    cdp_alerts_count: int = 0       # in_progress AND 0 <= days_remaining <= 7
+    cdp_expired_unpaid_count: int = 0  # past deadline, not paid/cancelled
 
 
 class LeaseRow(BaseModel):
@@ -437,7 +535,7 @@ AUDIT_ACTIONS = ("create", "update", "delete", "export", "login", "login_failed"
 AUDIT_ENTITY_TYPES = (
     "property", "lease", "tenant", "payment", "rent_revision",
     "charge_regularization", "document", "user", "group", "audit_log",
-    "auth",
+    "auth", "procedure",
 )
 
 

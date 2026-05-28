@@ -162,6 +162,38 @@ class Document(Base):
     upload_date = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Procedure(Base):
+    __tablename__ = "procedures"
+    id                  = Column(Integer, primary_key=True)
+    lease_id            = Column(Integer, ForeignKey("leases.id", ondelete="CASCADE"), nullable=False)
+    parent_procedure_id = Column(Integer, ForeignKey("procedures.id", ondelete="SET NULL"))
+    procedure_type      = Column(String(40), nullable=False, default="commandement_payer")
+    notification_date   = Column(Date, nullable=False)
+    deadline_date       = Column(Date, nullable=False)
+    amount_rent         = Column(Numeric(10, 2), nullable=False, default=Decimal("0"))
+    amount_fees         = Column(Numeric(10, 2), nullable=False, default=Decimal("0"))
+    amount_other        = Column(Numeric(10, 2), nullable=False, default=Decimal("0"))
+    status              = Column(String(20), nullable=False, default="in_progress")
+    bailiff_name        = Column(Text)
+    act_reference       = Column(Text)
+    notes               = Column(Text)
+    created_at          = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ProcedurePayment(Base):
+    """Manual association of a Payment to a Procedure — used when a payment
+    received outside the [notification, deadline] window must still count
+    toward solving the procedure (typical case: rent paid between the day
+    the landlord requested the act and the day the bailiff actually served
+    it). Auto-imputation by date range stays implicit and is computed at
+    read time; this table only stores extras."""
+    __tablename__ = "procedure_payments"
+    procedure_id = Column(Integer, ForeignKey("procedures.id", ondelete="CASCADE"), primary_key=True)
+    payment_id   = Column(Integer, ForeignKey("payments.id",   ondelete="CASCADE"), primary_key=True)
+    created_at   = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class AuditLog(Base):
     """Append-only audit trail.
 

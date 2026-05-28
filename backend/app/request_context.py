@@ -3,8 +3,7 @@
 A `ContextVar` populated by the `ClientIPMiddleware` so that any code path
 inside a request (in particular `audit_log.log_event`) can read the caller's
 IP without every router having to thread a `Request` object through its
-signature. Trusts the first hop of `X-Forwarded-For` when a reverse proxy
-sets it, otherwise falls back to the direct peer address.
+signature. Trusts the first hop of `X-Forwarded-For` (HAProxy in this lab).
 """
 
 from __future__ import annotations

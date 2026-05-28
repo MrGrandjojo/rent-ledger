@@ -15,24 +15,37 @@ profile with encrypted signature.
 - Properties, tenants, leases (with amendments / *avenants*), rent revisions
   with IRL-style anniversary tracking, tacit renewal.
 - Monthly payment tracking with auto-generated unpaid rows (catch-up at boot
-  and daily at 01:00 server-time) and bulk retroactive entry.
+  and daily at 01:00 server-time) and bulk retroactive entry. Paginated
+  listing with server-side filters by year and lease.
 - Charges regularization (per lease, per year).
+- **Procedures (commandement de payer)** — track formal demands to pay
+  with auto-imputation of payments falling within the 2-month legal window,
+  plus manual attachment for edge cases. Status (in progress / paid /
+  expired / cancelled) recomputed live from the payment data.
 - PDF rent receipt generation, with optional landlord signature embedded
   (encrypted at rest with AES-256-GCM).
 - Document upload (lease scans, receipts, other) with per-property access
-  scoping.
+  scoping. Hard 25 MB cap and magic-number content sniffing (PDF / PNG / JPG)
+  against extension spoofing.
 - Admin / supervisor management UI for users, groups and property scoping.
-- Append-only audit log with CSV export (admin-only).
+- Append-only audit log (partitioned by year for long-term retention) with
+  CSV export (admin-only).
+- **Prometheus metrics** at `/api/metrics` (HTTP histograms + business
+  gauges: active leases, CDP counts, current-month unpaid, etc.).
 
 ## Tech stack
 
-- **Backend** — FastAPI 0.115, SQLAlchemy 2, PostgreSQL 16
+- **Backend** — FastAPI 0.115, SQLAlchemy 2, PostgreSQL 16, uvicorn
+  multi-worker (4 by default)
 - **Frontend** — React 18, Vite 5, Tailwind 3, React Router 6
 - **Auth** — JWT HS256 in an HttpOnly cookie (`SameSite=Lax`, `Secure` opt-in),
   bcrypt cost 12, rate-limiting on `/login`
 - **Crypto** — AES-256-GCM for signatures, key in env
 - **PDF** — fpdf2 2.8
-- **Scheduler** — APScheduler 3.10 (monthly payment generation)
+- **Scheduler** — APScheduler 3.10 (monthly payment generation, CDP status
+  refresh, audit partition maintenance) — runs in a single worker via an
+  fcntl file-lock election
+- **Monitoring** — `prometheus-fastapi-instrumentator` 7.0
 - **Container** — Docker Compose (also works under Podman with `podman compose`)
 
 ---
@@ -86,6 +99,29 @@ Before exposing the app on the public internet:
    (`docker compose exec rental-db pg_dump -U rental rental > backup.sql`).
 5. Change the default admin password immediately after first login (the app
    enforces this on first connection, but verify it happened).
+6. Block `/api/metrics` from external access at your reverse proxy (it's
+   unauthenticated by design — meant to be scraped by Prometheus on an
+   internal network).
+
+### Monitoring
+
+The backend exposes Prometheus metrics at `/api/metrics` (no auth). Example
+scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: rental
+    scrape_interval: 15s
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ['rental-host:8080']
+```
+
+You get the standard HTTP histograms (per endpoint latency, request count,
+in-progress, status codes) plus seven business gauges:
+`rental_active_leases`, `rental_properties_total`, `rental_tenants_total`,
+`rental_cdp_in_progress`, `rental_cdp_expired_unpaid`,
+`rental_payments_unpaid_current_month`, `rental_audit_logs_total`.
 
 ---
 

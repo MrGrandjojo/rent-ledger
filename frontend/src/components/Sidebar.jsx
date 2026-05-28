@@ -8,6 +8,7 @@ const NAV = [
   { to: '/leases',        label: 'Baux',            icon: '📄' },
   { to: '/payments',      label: 'Paiements',       icon: '💶' },
   { to: '/charges',       label: 'Charges',         icon: '📊' },
+  { to: '/procedures',    label: 'Procédures',      icon: '⚖️' },
   { to: '/documents',     label: 'Documents',       icon: '📁' },
   { to: '/settings',      label: 'Paramètres',      icon: '⚙️' },
   { to: '/administration', label: 'Administration', icon: '🛡️', requireRole: ['admin', 'supervisor'] },

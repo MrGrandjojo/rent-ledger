@@ -15,9 +15,31 @@ from ..schemas import DocumentOut
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
-ALLOWED_TYPES = {"rent_receipt", "lease_scan", "other"}
+ALLOWED_TYPES = {"rent_receipt", "lease_scan", "commandement_payer", "other"}
 
 _DOCUMENT_FIELDS = ["id", "lease_id", "type", "file_name", "stored_path"]
+
+# 25 MB cap on uploads — covers a scanned multi-page PDF lease comfortably
+# while preventing single-process memory exhaustion. Nginx must also enforce
+# `client_max_body_size 25M` so oversize requests are rejected at the edge
+# before reaching uvicorn.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+# Magic-number prefixes we accept. Extension is unreliable (and trivially
+# spoofable); content sniffing is the actual gate. PNG/JPG kept because
+# scans are sometimes saved as images, even for lease docs.
+_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"%PDF-",                     "pdf"),
+    (b"\x89PNG\r\n\x1a\n",         "png"),
+    (b"\xff\xd8\xff",              "jpg"),
+)
+
+
+def _sniff_kind(content: bytes) -> str | None:
+    for prefix, kind in _MAGIC_PREFIXES:
+        if content.startswith(prefix):
+            return kind
+    return None
 
 
 def _doc_visible(db: Session, user: User, doc: Document) -> bool:
@@ -55,12 +77,37 @@ async def upload_document(
     if doc_type not in ALLOWED_TYPES:
         raise HTTPException(400, "Type de document invalide")
 
-    ext = os.path.splitext(file.filename)[1] if file.filename else ""
-    stored_name = f"{uuid.uuid4().hex}{ext}"
+    # Early size gate via Content-Length when the client provides it —
+    # avoids reading multi-GB bodies into memory before realising they're
+    # over the cap. The streamed read below is the second line of defence
+    # for clients that lie about the header.
+    declared = file.size if hasattr(file, "size") else None
+    if declared is not None and declared > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"Fichier trop volumineux ({declared // 1024} KB > "
+            f"{MAX_UPLOAD_BYTES // 1024} KB)",
+        )
+
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413, f"Fichier trop volumineux (> {MAX_UPLOAD_BYTES // 1024} KB)"
+        )
+
+    kind = _sniff_kind(content)
+    if kind is None:
+        raise HTTPException(
+            415, "Format non supporté — PDF, PNG ou JPG uniquement"
+        )
+
+    # Use the sniffed type for the stored extension, not the user-provided
+    # one — defends against `evil.pdf` that's actually HTML/JS or the
+    # reverse.
+    stored_name = f"{uuid.uuid4().hex}.{kind}"
     dest = os.path.join(settings.upload_dir, stored_name)
     os.makedirs(settings.upload_dir, exist_ok=True)
 
-    content = await file.read()
     with open(dest, "wb") as f:
         f.write(content)
 

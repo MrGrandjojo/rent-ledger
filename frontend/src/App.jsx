@@ -10,6 +10,8 @@ import Leases from './pages/Leases'
 import LeaseDetail from './pages/LeaseDetail'
 import Payments from './pages/Payments'
 import Charges from './pages/Charges'
+import Procedures from './pages/Procedures'
+import ProcedureDetail from './pages/ProcedureDetail'
 import Documents from './pages/Documents'
 import Settings from './pages/Settings'
 import Administration from './pages/Administration'
@@ -49,6 +51,8 @@ function AppRoutes() {
         <Route path="leases/:id" element={<LeaseDetail />} />
         <Route path="payments" element={<Payments />} />
         <Route path="charges" element={<Charges />} />
+        <Route path="procedures" element={<Procedures />} />
+        <Route path="procedures/:id" element={<ProcedureDetail />} />
         <Route path="documents" element={<Documents />} />
         <Route path="settings" element={<Settings />} />
         <Route path="administration" element={<RequireAdminOrSupervisor><Administration /></RequireAdminOrSupervisor>} />

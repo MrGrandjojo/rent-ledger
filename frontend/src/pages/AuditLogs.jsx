@@ -22,6 +22,7 @@ const ENTITY_LABELS = {
   user: 'Utilisateur',
   group: 'Groupe',
   audit_log: 'Journal',
+  procedure: 'Procédure',
 }
 
 function ActionBadge({ action }) {

@@ -8,13 +8,18 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
 from .database import SessionLocal, engine, seed_initial_users
+from .metrics import instrument_app
 from .rate_limit import limiter
 from .request_context import ClientIPMiddleware
 from .routers import (
     admin, audit_logs, auth, charges, dashboard, documents, leases,
-    payments, profile, properties, receipts, revisions, tenants,
+    payments, procedures, profile, properties, receipts, revisions, tenants,
 )
-from .scheduler import run_catch_up, shutdown_scheduler, start_scheduler
+from .scheduler import (
+    acquire_scheduler_lock, ensure_audit_partitions,
+    refresh_procedure_statuses, run_catch_up, shutdown_scheduler,
+    start_scheduler,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,19 +50,50 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    try:
-        created, touched = run_catch_up()
+    # Worker election — with `--workers N`, only one process per container
+    # runs the scheduler and the boot-time catch-ups (file lock on
+    # /tmp/rental-scheduler.lock). Other workers serve the API only.
+    is_scheduler_worker = acquire_scheduler_lock()
+    if not is_scheduler_worker:
         logger.info(
-            "Startup catch-up — created %d payment(s) across %d lease(s)",
-            created, touched,
+            "Scheduler election: another worker holds the lock — this worker serves API only"
         )
-    except Exception:
-        logger.exception("Startup catch-up failed (continuing without it)")
+    else:
+        logger.info("Scheduler election: this worker runs the scheduler + boot jobs")
 
-    start_scheduler()
+        # Startup catch-up — generate any missing monthly Payment rows so a
+        # restart mid-month or after a downtime gap does not leave holes.
+        try:
+            created, touched = run_catch_up()
+            logger.info(
+                "Startup catch-up — created %d payment(s) across %d lease(s)",
+                created, touched,
+            )
+        except Exception:
+            logger.exception("Startup catch-up failed (continuing without it)")
+
+        # Boot-time procedure status refresh — keeps the persisted `status`
+        # column in sync with the recomputed value after any downtime gap.
+        try:
+            updated = refresh_procedure_statuses()
+            logger.info("Startup CDP refresh — updated %d procedure(s)", updated)
+        except Exception:
+            logger.exception("Startup CDP refresh failed (continuing without it)")
+
+        # Boot-time audit partition check — guarantees the current-year +
+        # next-year partitions exist before any write hits audit_logs (a
+        # missing partition would make INSERT fail with an obscure error).
+        try:
+            created = ensure_audit_partitions()
+            logger.info("Startup audit partitions — created %d", created)
+        except Exception:
+            logger.exception("Startup audit partition check failed")
+
+        start_scheduler()
 
     yield
-    shutdown_scheduler()
+    if is_scheduler_worker:
+        shutdown_scheduler()
 
 
 app = FastAPI(
@@ -89,11 +125,17 @@ app.include_router(tenants.router)
 app.include_router(leases.router)
 app.include_router(revisions.router)
 app.include_router(payments.router)
+app.include_router(procedures.router)
 app.include_router(charges.router)
 app.include_router(documents.router)
 app.include_router(receipts.router)
 app.include_router(dashboard.router)
 app.include_router(audit_logs.router)
+
+# Prometheus instrumentation — exposes /api/metrics with HTTP request
+# histograms + the business gauges defined in app/metrics.py. Must come
+# after all routers are mounted so every endpoint is instrumented.
+instrument_app(app)
 
 
 @app.get("/api/health")

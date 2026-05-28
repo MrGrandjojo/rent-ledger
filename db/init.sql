@@ -1,5 +1,5 @@
--- Rental property management database schema (v2.0)
--- All timestamps stored in UTC; displayed in Europe/Paris in the application.
+-- Rental property management database schema (v2.4)
+-- All timestamps stored in UTC; displayed in the server timezone.
 -- Multi-user: roles + groups gate per-property access; landlord profile is per-user.
 
 CREATE TABLE IF NOT EXISTS users (
@@ -126,14 +126,49 @@ CREATE TABLE IF NOT EXISTS charges_regularizations (
 CREATE TABLE IF NOT EXISTS documents (
     id          SERIAL PRIMARY KEY,
     lease_id    INTEGER      NOT NULL REFERENCES leases(id),
-    type        VARCHAR(20)  NOT NULL CHECK (type IN ('rent_receipt', 'lease_scan', 'other')),
+    type        VARCHAR(20)  NOT NULL CHECK (type IN ('rent_receipt', 'lease_scan', 'commandement_payer', 'other')),
     file_name   VARCHAR(255) NOT NULL,
     stored_path VARCHAR(500) NOT NULL,
     upload_date TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS audit_logs (
+CREATE TABLE IF NOT EXISTS procedures (
     id                  SERIAL PRIMARY KEY,
+    lease_id            INTEGER     NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
+    parent_procedure_id INTEGER     REFERENCES procedures(id) ON DELETE SET NULL,
+    procedure_type      VARCHAR(40) NOT NULL
+                          CHECK (procedure_type IN ('commandement_payer')),
+    notification_date   DATE        NOT NULL,
+    deadline_date       DATE        NOT NULL,
+    amount_rent         NUMERIC(10, 2) NOT NULL DEFAULT 0,
+    amount_fees         NUMERIC(10, 2) NOT NULL DEFAULT 0,
+    amount_other        NUMERIC(10, 2) NOT NULL DEFAULT 0,
+    status              VARCHAR(20) NOT NULL DEFAULT 'in_progress'
+                          CHECK (status IN ('in_progress', 'paid',
+                                            'expired_unpaid', 'cancelled')),
+    bailiff_name        TEXT,
+    act_reference       TEXT,
+    notes               TEXT,
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CHECK (deadline_date >= notification_date)
+);
+
+CREATE TABLE IF NOT EXISTS procedure_payments (
+    procedure_id INTEGER NOT NULL REFERENCES procedures(id) ON DELETE CASCADE,
+    payment_id   INTEGER NOT NULL REFERENCES payments(id)   ON DELETE CASCADE,
+    created_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (procedure_id, payment_id)
+);
+
+-- audit_logs is PARTITIONED BY RANGE on created_at (one partition per year).
+-- The boot job `ensure_audit_partitions` in app/scheduler.py creates the
+-- current-year + next-year partitions automatically, so a fresh deploy only
+-- needs the parent table here. The PK includes the partition key as required
+-- by Postgres for partitioned tables.
+CREATE SEQUENCE IF NOT EXISTS audit_logs_id_seq;
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id                  INTEGER NOT NULL DEFAULT nextval('audit_logs_id_seq'),
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     user_id             INTEGER REFERENCES users(id) ON DELETE SET NULL,
     user_display_name   TEXT NOT NULL DEFAULT 'system',
@@ -144,13 +179,15 @@ CREATE TABLE IF NOT EXISTS audit_logs (
                           CHECK (entity_type IN ('property', 'lease', 'tenant', 'payment',
                                                   'rent_revision', 'charge_regularization',
                                                   'document', 'user', 'group', 'audit_log',
-                                                  'auth')),
+                                                  'auth', 'procedure')),
     entity_id           TEXT,
     entity_label        TEXT,
     before              JSONB,
     after               JSONB,
-    ip_address          TEXT
-);
+    ip_address          TEXT,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+ALTER SEQUENCE audit_logs_id_seq OWNED BY audit_logs.id;
 
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_leases_property  ON leases(property_id);
@@ -161,6 +198,11 @@ CREATE INDEX IF NOT EXISTS idx_payments_lease   ON payments(lease_id);
 CREATE INDEX IF NOT EXISTS idx_payments_period  ON payments(year, month);
 CREATE INDEX IF NOT EXISTS idx_charges_lease    ON charges_regularizations(lease_id);
 CREATE INDEX IF NOT EXISTS idx_documents_lease  ON documents(lease_id);
+CREATE INDEX IF NOT EXISTS idx_procedures_lease    ON procedures(lease_id);
+CREATE INDEX IF NOT EXISTS idx_procedures_status   ON procedures(status);
+CREATE INDEX IF NOT EXISTS idx_procedures_parent   ON procedures(parent_procedure_id);
+CREATE INDEX IF NOT EXISTS idx_procedures_deadline ON procedures(deadline_date);
+CREATE INDEX IF NOT EXISTS idx_procedure_payments_payment ON procedure_payments(payment_id);
 CREATE INDEX IF NOT EXISTS idx_revisions_lease  ON rent_revisions(lease_id, effective_from);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at  ON audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user        ON audit_logs(user_id);

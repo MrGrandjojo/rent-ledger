@@ -28,8 +28,9 @@ router = APIRouter(prefix="/api/receipts", tags=["receipts"])
 
 def _slug(s: str) -> str:
     # Transliterate accents to ASCII (é → e, è → e, ç → c, …) before
-    # slugifying — otherwise a name like "LEFÈVRE" would become "lef-vre"
-    # with the È dropped and the surrounding hyphens left behind.
+    # slugifying — otherwise an accented name would lose its diacritic
+    # characters entirely (e.g. "ÉTÉ" → "" instead of "ete") and leave
+    # dangling hyphens around them.
     normalized = unicodedata.normalize("NFKD", s or "")
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-zA-Z0-9]+", "-", ascii_only).strip("-").lower() or "locataire"

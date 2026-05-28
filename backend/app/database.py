@@ -2,7 +2,19 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+# Connection pool sized for a small team on a single host. With uvicorn
+# `--workers 4` (the default in the Dockerfile) this gives up to 40
+# active connections + 20 burst — well under PostgreSQL's default
+# `max_connections=100`. `pool_recycle=1800` (30 min) prevents stale TCP
+# connections hitting Postgres' 1h idle timeout.
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=5,
+    pool_recycle=1800,
+    pool_timeout=30,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

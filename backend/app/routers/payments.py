@@ -5,14 +5,14 @@ from ..audit_log import log_event, snapshot_row
 from ..database import get_db
 from ..dependencies import (
     accessible_property_ids, assert_lease_access, get_current_user,
-    has_global_access,
+    has_global_access, require_admin_or_supervisor,
 )
 from ..lease_rules import effective_revision_for, expected_amount_for
 from ..models import Lease, Payment, Property, Tenant, User
 from ..schemas import (
     BulkPaymentCreate, BulkPaymentPreviewOut, BulkPaymentPreviewRow,
-    BulkPaymentResult, ExpectedAmountOut, PaymentCreate, PaymentOut,
-    PaymentUpdate,
+    BulkPaymentResult, ExpectedAmountOut, PaginatedPaymentsOut,
+    PaymentCreate, PaymentOut, PaymentUpdate,
 )
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
@@ -76,9 +76,30 @@ def get_expected_amount(
     )
 
 
-@router.get("", response_model=list[PaymentOut])
-def list_payments(lease_id: int | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    q = db.query(Payment)
+@router.get("", response_model=PaginatedPaymentsOut)
+def list_payments(
+    lease_id: int | None = None,
+    year: int | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Paginated listing — see PaginatedPaymentsOut. At PME scale (~1000
+    baux × 12 months × multiple years), an unpaginated GET would return
+    tens of thousands of rows; the envelope shape forces every consumer
+    to handle pagination explicitly. `year` filter is server-side so the
+    frontend can narrow before paging.
+
+    The join on Property/Tenant is always present so the secondary sort
+    (within a (year, month) bucket → by property name then tenant name)
+    is stable across requests."""
+    q = (
+        db.query(Payment)
+        .join(Lease, Lease.id == Payment.lease_id)
+        .join(Property, Property.id == Lease.property_id)
+        .join(Tenant, Tenant.id == Lease.tenant_id)
+    )
     if lease_id is not None:
         assert_lease_access(db, user, lease_id)
         q = q.filter(Payment.lease_id == lease_id)
@@ -86,9 +107,26 @@ def list_payments(lease_id: int | None = None, db: Session = Depends(get_db), us
         ids = accessible_property_ids(db, user)
         if ids is not None:
             if not ids:
-                return []
-            q = q.join(Lease, Lease.id == Payment.lease_id).filter(Lease.property_id.in_(ids))
-    return q.order_by(Payment.year.desc(), Payment.month.desc()).all()
+                return PaginatedPaymentsOut(items=[], total=0, page=page, page_size=page_size)
+            q = q.filter(Lease.property_id.in_(ids))
+    if year is not None:
+        q = q.filter(Payment.year == year)
+
+    total = q.count()
+    items = (
+        q.order_by(
+            Payment.year.desc(),
+            Payment.month.desc(),
+            Property.name.asc(),
+            Tenant.last_name.asc(),
+            Tenant.first_name.asc(),
+            Payment.lease_id.asc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return PaginatedPaymentsOut(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.post("", response_model=PaymentOut, status_code=201)
@@ -171,7 +209,14 @@ def update_payment(payment_id: int, body: PaymentUpdate, db: Session = Depends(g
 
 
 @router.delete("/{payment_id}", status_code=204)
-def delete_payment(payment_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def delete_payment(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin_or_supervisor),
+):
+    """Suppression réservée à admin/supervisor — un bailleur (role=user)
+    peut éditer ses paiements mais pas les supprimer (perte d'historique
+    + cohérence des soldes cumulés)."""
     p = db.get(Payment, payment_id)
     if not p or not _payment_visible(db, user, p):
         raise HTTPException(404, "Paiement introuvable")

@@ -5,15 +5,17 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..dependencies import accessible_property_ids, get_current_user
 from ..lease_rules import (
-    compute_next_irl_revision, current_effective_revision,
-    expected_amount_for, notice_period_alert, resolve_end_date,
+    batch_effective_revisions, compute_next_irl_revision,
+    is_amendment, notice_period_alert,
 )
-from ..models import Lease, Payment, Property, Tenant, User
+from ..models import Lease, Payment, Procedure, Property, Tenant, User
+from ..procedure_rules import attached_payments, compute_status_and_totals
 from ..schemas import DashboardOut, DashboardStats, LeaseRow
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 IRL_ALERT_DAYS = 30
+CDP_ALERT_DAYS = 7
 
 
 @router.get("", response_model=DashboardOut)
@@ -49,11 +51,6 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
     for lease in active_leases:
         leases_by_property.setdefault(lease.property_id, []).append(lease)
 
-    # Index every payment of every active lease — we need both unpaid
-    # AND overpaid rows because an overpayment (received > expected)
-    # must reduce the all-months total like a payment toward an arrears
-    # month would (e.g. ROMY-LEFÈVRE pays 618 € for one 515 € month, the
-    # 103 € surplus credits down his cumulative debt).
     active_lease_ids = [l.id for l in active_leases]
     all_lease_payments: list[Payment] = (
         db.query(Payment)
@@ -69,6 +66,45 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
         if p.year == current_year and p.month == current_month:
             payments_this_month.append(p)
             payment_by_lease[p.lease_id] = p
+
+    # ── Batch lookups — kills the N+1 storm at PME scale (1000 baux) ─────
+    # Previously this loop did 5 sub-queries per active lease
+    # (current_revision × 2, tenant, end_date parent, expected). At 1000
+    # baux that's 5000 round-trips per dashboard load. Now: 4 batched
+    # queries total, then everything in memory.
+    today_first_of_month = date(current_year, current_month, 1)
+    revs_at_today = batch_effective_revisions(db, active_lease_ids, today)
+    revs_at_month_start = batch_effective_revisions(db, active_lease_ids, today_first_of_month)
+
+    tenant_ids = list({l.tenant_id for l in active_leases})
+    tenants_by_id: dict[int, Tenant] = (
+        {t.id: t for t in db.query(Tenant).filter(Tenant.id.in_(tenant_ids)).all()}
+        if tenant_ids else {}
+    )
+
+    parent_ids = list({l.parent_lease_id for l in active_leases if l.parent_lease_id})
+    parents_by_id: dict[int, Lease] = (
+        {l.id: l for l in db.query(Lease).filter(Lease.id.in_(parent_ids)).all()}
+        if parent_ids else {}
+    )
+
+    def _expected_for(lease: Lease) -> Decimal:
+        rev = revs_at_month_start.get(lease.id)
+        if rev is None:
+            raise RuntimeError(
+                f"Lease {lease.id} has no rent_revision — data integrity violation"
+            )
+        return Decimal(rev.monthly_rent) + Decimal(rev.monthly_charges)
+
+    def _effective_end_for(lease: Lease) -> date | None:
+        # Amendments inherit end_date from their parent — at most 1 hop
+        # (single-level nesting enforced by leases router).
+        if is_amendment(lease):
+            parent = parents_by_id.get(lease.parent_lease_id)
+            if parent is None:
+                return lease.end_date
+            return parent.end_date
+        return lease.end_date
 
     rows: list[LeaseRow] = []
 
@@ -86,11 +122,11 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
             continue
 
         for lease in leases_here:
-            tenant = db.get(Tenant, lease.tenant_id)
+            tenant = tenants_by_id.get(lease.tenant_id)
             tenant_name = f"{tenant.first_name} {tenant.last_name}" if tenant else None
 
             # Current effective rent — rent_revisions is sole source of truth
-            rev = current_effective_revision(db, lease.id, today)
+            rev = revs_at_today.get(lease.id)
             if rev is None:
                 # Defensive — should never happen (every lease has an initial)
                 rent = charges = Decimal("0")
@@ -100,7 +136,7 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
             total = rent + charges
 
             # Alerts (amendments inherit end_date from their parent)
-            effective_end = resolve_end_date(lease, db, today)
+            effective_end = _effective_end_for(lease)
             next_irl = compute_next_irl_revision(lease.start_date, today)
             irl_alert = 0 <= (next_irl - today).days <= IRL_ALERT_DAYS
             notice_alert = notice_period_alert(lease, effective_end, today)
@@ -112,7 +148,7 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
             # immediately. The scheduler does NOT write the unpaid row
             # until the month is over (see `scheduler.run_catch_up`).
             payment = payment_by_lease.get(lease.id)
-            expected_this_month = expected_amount_for(db, lease, current_year, current_month)
+            expected_this_month = _expected_for(lease)
             if payment:
                 payment_info = {
                     "status": payment.status,
@@ -184,10 +220,9 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
     unpaid_count = unpaid_explicit + unpaid_missing
 
     # Expected total for the current month — sum every active lease's
-    # expected. Useful to compute the "loyers attendus" figure even if
-    # no payment row exists yet for some leases.
+    # expected, using the pre-batched revisions (no extra DB roundtrips).
     total_expected = sum(
-        (expected_amount_for(db, l, current_year, current_month) for l in active_leases),
+        (_expected_for(l) for l in active_leases),
         Decimal("0"),
     )
     total_received = sum((Decimal(p.received_amount) for p in payments_this_month), Decimal("0"))
@@ -196,14 +231,32 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
     total_outstanding_current = sum(
         (Decimal(p.outstanding_balance) for p in payments_this_month), Decimal("0")
     ) + sum(
-        (expected_amount_for(db, l, current_year, current_month)
-         for l in active_leases if l.id not in payment_by_lease),
+        (_expected_for(l) for l in active_leases if l.id not in payment_by_lease),
         Decimal("0"),
     )
     total_outstanding_all = sum(
         (row.outstanding_total for row in rows if row.lease_id is not None),
         Decimal("0"),
     )
+
+    # ── Procedures (commandement de payer) ──────────────────────────────
+    # Recompute status for every accessible procedure so the alert count
+    # is correct even if the stored `status` column is stale.
+    proc_q = db.query(Procedure)
+    if accessible is not None:
+        proc_q = proc_q.join(Lease, Lease.id == Procedure.lease_id).filter(
+            Lease.property_id.in_(accessible)
+        )
+    cdp_active = cdp_alerts = cdp_expired = 0
+    for proc in proc_q.all():
+        payments, _ = attached_payments(db, proc)
+        status_v, _, _, _, days = compute_status_and_totals(proc, payments)
+        if status_v == "in_progress":
+            cdp_active += 1
+            if 0 <= days <= CDP_ALERT_DAYS:
+                cdp_alerts += 1
+        elif status_v == "expired_unpaid":
+            cdp_expired += 1
 
     stats = DashboardStats(
         properties_total=len(properties),
@@ -216,6 +269,9 @@ def get_dashboard(db: Session = Depends(get_db), user: User = Depends(get_curren
         total_outstanding_current_month=total_outstanding_current,
         total_outstanding_all_months=total_outstanding_all,
         total_outstanding=total_outstanding_current,
+        cdp_active_count=cdp_active,
+        cdp_alerts_count=cdp_alerts,
+        cdp_expired_unpaid_count=cdp_expired,
     )
 
     return DashboardOut(stats=stats, rows=rows)

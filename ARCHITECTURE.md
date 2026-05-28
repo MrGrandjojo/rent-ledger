@@ -68,12 +68,37 @@ Full DDL in [db/init.sql](db/init.sql). Summary:
   `total_actual_charges`, `total_provisions_collected`, `balance`, `notes?`,
   `created_at`. UNIQUE `(lease_id, year)`.
 - **documents** — `id`, `lease_id` FK, `type` ∈
-  `(rent_receipt|lease_scan|other)`, `file_name`, `stored_path`
-  (relative inside `/app/uploads`), `upload_date`.
-- **audit_logs** — append-only. `id`, `created_at`, `user_id` FK SET NULL,
+  `(rent_receipt|lease_scan|commandement_payer|other)`, `file_name`,
+  `stored_path` (relative inside `/app/uploads`), `upload_date`.
+- **procedures** — `id`, `lease_id` FK CASCADE, `parent_procedure_id` FK
+  SET NULL (extensible chaining: a `commandement_payer` may later spawn
+  an `assignation`, etc.), `procedure_type` ∈ `(commandement_payer)`,
+  `notification_date`, `deadline_date` (auto = `notification_date + 2
+  months` for CDP per art. 24 loi du 6 juillet 1989; editable),
+  decomposed amounts `amount_rent`, `amount_fees`, `amount_other`,
+  `status` ∈ `(in_progress|paid|expired_unpaid|cancelled)`,
+  `bailiff_name?`, `act_reference?`, `notes?`, `created_at`,
+  `updated_at`. CHECK `deadline_date >= notification_date`.
+- **procedure_payments** — manual imputation of a Payment to a
+  Procedure. Composite PK `(procedure_id, payment_id)` (both CASCADE).
+  Used when a payment falling **outside** `[notification_date,
+  deadline_date]` must still count toward solving the procedure
+  (typical case: rent paid between the day the landlord requests the
+  act and the day the bailiff serves it). Payments **inside** the
+  window are imputed automatically and not stored here.
+- **audit_logs** — append-only, **PARTITIONED BY RANGE (`created_at`)**,
+  one partition per year (`audit_logs_YYYY`). PK is `(id, created_at)`
+  as required by the partition key. The boot job
+  `ensure_audit_partitions` in `app/scheduler.py` provisions the
+  current-year + next-year partitions automatically; a monthly job
+  (day-1 02:00 server time) does the same in steady state. To archive
+  an old year: `ALTER TABLE audit_logs DETACH PARTITION
+  audit_logs_YYYY;` then `COPY` it out and `DROP TABLE` — fully manual,
+  no automatic retention.
+  Columns: `id`, `created_at`, `user_id` FK SET NULL,
   `user_display_name` (snapshot), `action` ∈
   `(create|update|delete|export|login|login_failed)`, `entity_type` ∈
-  `(property|lease|tenant|payment|rent_revision|charge_regularization|document|user|group|audit_log|auth)`,
+  `(property|lease|tenant|payment|rent_revision|charge_regularization|document|user|group|audit_log|auth|procedure)`,
   `entity_id`, `entity_label` (snapshot), `before` JSONB, `after` JSONB,
   `ip_address`. Application code must NOT issue UPDATE or DELETE on this
   table outside the admin-only purge endpoint. Writes go through
@@ -82,7 +107,9 @@ Full DDL in [db/init.sql](db/init.sql). Summary:
 
 **Relationships**: User 1→1 UserProfile; User N↔N Groups; Group N↔N
 Properties; Property 1→N Leases; Tenant 1→N Leases; Lease 1→N
-RentRevisions / Payments / ChargesRegularizations / Documents.
+RentRevisions / Payments / ChargesRegularizations / Documents /
+Procedures; Procedure self-ref (parent/child for future chaining);
+Procedure N↔N Payments via `procedure_payments`.
 
 ---
 
@@ -128,6 +155,44 @@ RentRevisions / Payments / ChargesRegularizations / Documents.
   the current-month projection if missing. This is the only formula that
   applies an overpayment surplus against arrears (the per-row
   `outstanding_balance` clamps at 0).
+- **Payments listing**: `GET /api/payments` returns a
+  `PaginatedPaymentsOut` envelope `{items, total, page, page_size}` —
+  never a raw list. Defaults `page=1`, `page_size=50`, hard cap 500.
+  Sort is `(year DESC, month DESC, property.name ASC, tenant.last_name
+  ASC, tenant.first_name ASC, lease_id ASC)` so the same lease keeps
+  the same visual slot from one month to the next.
+- **Hot-path batching**: dashboard and `GET /api/leases` use batched
+  helpers (`batch_effective_revisions`, `batch_initial_revisions` in
+  `lease_rules.py`) + pre-loaded property/tenant/parent maps so the
+  cost is `O(1)` SQL roundtrips instead of `O(n_leases)`. Same pattern
+  for `GET /api/procedures` via `_batch_to_out`.
+- **Procedures (CDP)**: status is **recomputed on every read** from
+  the attached payments + dates and returned to clients in memory. The
+  persisted `status` column is **never** written from a GET handler;
+  it is converged by the `refresh_procedure_statuses` job in
+  `app/scheduler.py` (daily at 01:30 server time + boot catch-up).
+  Rules in `procedure_rules.py`:
+  - `total_due = amount_rent + amount_fees + amount_other`.
+  - `total_paid = Σ received_amount` over attached payments.
+  - Attached = **auto** (any Payment of the lease whose
+    `payment_date ∈ [notification_date, deadline_date]`, computed on
+    the fly, never stored) **+ manual** (rows in `procedure_payments`).
+  - `paid` iff `total_paid ≥ total_due` AND latest contributing
+    `payment_date ≤ deadline_date`.
+  - `expired_unpaid` iff `today > deadline_date` and not paid/cancelled.
+  - `cancelled` is sticky (manual state via
+    `POST /api/procedures/{id}/cancel`).
+  - Else `in_progress`.
+- **CDP default deadline**: for `procedure_type='commandement_payer'`,
+  `deadline_date = notification_date + 2 months` (with day clamping for
+  short months). Auto-filled by both server and frontend; the user can
+  override if the act states a different delay.
+- **Scheduler — procedure status refresh**: same scheduler, job
+  `refresh_procedure_statuses` at cron `01:30`, plus boot catch-up.
+- **Scheduler — audit partitions**: job `ensure_audit_partitions` at
+  cron `day-1 02:00`, plus boot catch-up. Creates yearly partitions for
+  `current_year` and `current_year+1` if missing — a write hitting a
+  date with no partition would fail.
 
 ---
 
@@ -151,6 +216,17 @@ RentRevisions / Payments / ChargesRegularizations / Documents.
 - `force_password_change=True` blocks every authenticated endpoint except
   `GET /api/auth/me` and `PUT /api/auth/change-password` until the user
   picks a new password.
+- Procedures (CDP): visibility, create/edit/cancel and payment
+  attach/detach are gated by `assert_lease_access` — any user
+  (including `role='user'`) with access to the underlying lease can
+  manage the procedure. **Deletion** (`DELETE /api/procedures/{id}`)
+  is restricted to `require_admin_or_supervisor` — irreversible action
+  on legal data.
+- Payments: list / create / update / partial actions remain open to
+  any user with lease access. **Deletion**
+  (`DELETE /api/payments/{id}`) is restricted to
+  `require_admin_or_supervisor` — preserves history and the cumulative
+  balance arithmetic.
 
 ---
 
@@ -172,6 +248,54 @@ RentRevisions / Payments / ChargesRegularizations / Documents.
 - `audit_logs.action`: only **admin** successful logins and **all** failed
   logins are recorded. Regular user / supervisor logins and all logouts are
   not, to keep the log focused on signals (modifications + auth anomalies).
+- Document upload pipeline (`POST /api/documents`): early
+  `Content-Length` gate → hard cap **25 MB** (`MAX_UPLOAD_BYTES` in
+  `routers/documents.py`, mirrored by nginx `client_max_body_size
+  25M`) → **magic-number content sniffing** (PDF / PNG / JPG only —
+  extension ignored, defends against `evil.pdf` masquerading) →
+  UUID-named file with the sniffed extension written to
+  `/app/uploads`.
+
+---
+
+## Concurrency & scaling
+
+- **Multi-worker uvicorn** — the Dockerfile starts uvicorn with
+  `--workers ${UVICORN_WORKERS:-4}`. Each worker is a separate Python
+  process; the GIL no longer serialises bcrypt / PDF generation / SQL
+  across HTTP calls.
+- **Scheduler election** — with multiple workers, only one runs the
+  APScheduler instance and the boot-time catch-ups (file lock on
+  `/tmp/rental-scheduler.lock`, `fcntl.LOCK_EX | LOCK_NB`). Others
+  serve the API only. Self-healing: if the elected worker dies, the
+  next boot of another worker acquires the lock. Single-host only —
+  multi-host deployments would need a distributed lock (Redis,
+  Postgres advisory).
+- **DB pool** — `pool_size=10, max_overflow=5, pool_recycle=1800`.
+  At 4 workers that's up to ~60 connections in burst, well under
+  PostgreSQL's default `max_connections=100`. `pool_recycle` cuts idle
+  connections before PostgreSQL's 1h idle timeout kicks them.
+
+---
+
+## Monitoring
+
+- `/api/metrics` (unauthenticated, intended for an internal scraper)
+  exposes Prometheus metrics via `prometheus-fastapi-instrumentator`:
+  - HTTP request histograms (latency, count, in-progress, status) —
+    **per-worker** because each uvicorn worker has its own registry.
+    Acceptable for a single host with a few users; Grafana aggregates
+    over time. For multi-host setups, use multiprocess mode or push
+    to a central registry.
+  - Seven business gauges defined in `app/metrics.py` refreshed **on
+    every scrape** by the worker that responds (7 `SELECT COUNT(*)`,
+    negligible at a 15s scrape interval): `rental_active_leases`,
+    `rental_properties_total`, `rental_tenants_total`,
+    `rental_cdp_in_progress`, `rental_cdp_expired_unpaid`,
+    `rental_payments_unpaid_current_month`,
+    `rental_audit_logs_total`.
+- Block external access to `/api/metrics` at the reverse proxy if the
+  host is internet-facing.
 
 ---
 

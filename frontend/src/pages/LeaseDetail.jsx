@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import api from '../api'
+import { useAuth } from '../AuthContext'
 import StatusBadge from '../components/StatusBadge'
 import AlertBanner from '../components/AlertBanner'
 import Modal from '../components/Modal'
@@ -137,6 +138,8 @@ function RevisionModal({ lease, onClose, onSaved }) {
 
 export default function LeaseDetail() {
   const { id } = useParams()
+  const { user } = useAuth()
+  const canDelete = user?.role === 'admin' || user?.role === 'supervisor'
   const [lease, setLease] = useState(null)
   const [payments, setPayments] = useState([])
   const [documents, setDocuments] = useState([])
@@ -148,11 +151,11 @@ export default function LeaseDetail() {
   const loadAll = async () => {
     const [l, p, d, r] = await Promise.all([
       api.get(`/leases/${id}`),
-      api.get('/payments', { params: { lease_id: id } }),
+      api.get('/payments', { params: { lease_id: id, page_size: 500 } }),
       api.get('/documents', { params: { lease_id: id } }),
       api.get(`/leases/${id}/revisions`),
     ])
-    setLease(l.data); setPayments(p.data); setDocuments(d.data); setRevisions(r.data)
+    setLease(l.data); setPayments(p.data.items); setDocuments(d.data); setRevisions(r.data)
   }
 
   useEffect(() => { loadAll() }, [id])
@@ -193,12 +196,11 @@ export default function LeaseDetail() {
   const irlAlert = irl && (irl - today) / 86400000 <= 30 && (irl - today) / 86400000 >= 0
 
   // Total dû — mirrors the dashboard's "Net outstanding" formula
-  // (ARCHITECTURE.md "Net outstanding (all-months)"): max(0, Σexpected − Σreceived)
+  // (PROJECT.md "Net outstanding (all-months)"): max(0, Σexpected − Σreceived)
   // across every Payment row, plus the current month projected as unpaid if
   // no row exists for it (active leases only). Net of overpayments — surplus
   // on month M cancels arrears on earlier months, which a naive sum of
-  // per-row `outstanding_balance` would not do (the per-row column clamps
-  // at 0 by design).
+  // per-row `outstanding_balance` would not do (PROJECT.md L138-139).
   const currentYear = today.getFullYear()
   const currentMonth = today.getMonth() + 1
   const hasCurrentMonthPayment = payments.some(
@@ -218,7 +220,7 @@ export default function LeaseDetail() {
 
   // Payments sorted ASC for the history table + running cumulative net
   // outstanding (oldest first). Formula matches the dashboard's "Total dû"
-  // (ARCHITECTURE.md "Net outstanding"): max(0, Σexpected − Σreceived) cumulated
+  // (PROJECT.md "Net outstanding"): max(0, Σexpected − Σreceived) cumulated
   // across the full history, so an overpayment in one month reduces the
   // displayed cumulative against earlier arrears.
   const paymentsAsc = [...payments].sort((a, b) => {
@@ -485,7 +487,9 @@ export default function LeaseDetail() {
                   <td className="table-td text-xs text-gray-500 max-w-[150px] truncate">{p.notes || ''}</td>
                   <td className="table-td text-right space-x-1">
                     <button className="btn-secondary btn-sm" title="Modifier" onClick={() => setEditingPayment(p)}>✏️</button>
-                    <button className="btn-danger btn-sm" title="Supprimer" onClick={() => deletePayment(p.id)}>🗑</button>
+                    {canDelete && (
+                      <button className="btn-danger btn-sm" title="Supprimer" onClick={() => deletePayment(p.id)}>🗑</button>
+                    )}
                   </td>
                 </tr>
               ))}

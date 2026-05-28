@@ -40,6 +40,36 @@ export default function Dashboard() {
       <h1 className="text-2xl font-bold text-gray-800">Tableau de bord</h1>
       <p className="text-sm text-gray-500">Période en cours : {periodLabel}</p>
 
+      {(Number(stats.cdp_alerts_count) > 0 || Number(stats.cdp_expired_unpaid_count) > 0) && (
+        <Link
+          to="/procedures"
+          className="block rounded-lg border-l-4 border-orange-500 bg-orange-50 px-4 py-3 hover:bg-orange-100"
+        >
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <p className="text-sm font-semibold text-orange-900">
+                ⚖️ Procédures à surveiller
+              </p>
+              <p className="text-xs text-orange-800 mt-0.5">
+                {Number(stats.cdp_alerts_count) > 0 && (
+                  <>
+                    {stats.cdp_alerts_count} commandement{stats.cdp_alerts_count > 1 ? 's' : ''} de payer
+                    {' '}arrive{stats.cdp_alerts_count > 1 ? 'nt' : ''} à échéance dans 7 jours ou moins.{' '}
+                  </>
+                )}
+                {Number(stats.cdp_expired_unpaid_count) > 0 && (
+                  <>
+                    {stats.cdp_expired_unpaid_count} commandement{stats.cdp_expired_unpaid_count > 1 ? 's' : ''}
+                    {' '}échu{stats.cdp_expired_unpaid_count > 1 ? 's' : ''} sans règlement.
+                  </>
+                )}
+              </p>
+            </div>
+            <span className="text-orange-800 text-sm font-medium">Voir les procédures →</span>
+          </div>
+        </Link>
+      )}
+
       {/* Stats — 2 rows of 4 cards, taille intermédiaire */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <StatCard label="Biens" value={stats.properties_total} color="blue" />
@@ -48,7 +78,15 @@ export default function Dashboard() {
           label="Loyers payés"
           value={stats.current_month_paid}
           sub={`sur ${stats.active_leases}`}
-          color="green"
+          color={
+            stats.active_leases === 0
+              ? 'blue'
+              : stats.current_month_paid === 0
+                ? 'red'
+                : stats.current_month_paid < stats.active_leases
+                  ? 'orange'
+                  : 'green'
+          }
         />
         <StatCard
           label="Impayés / Partiels"

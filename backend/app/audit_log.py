@@ -23,7 +23,7 @@ ALLOWED_ACTIONS = (
 ALLOWED_ENTITY_TYPES = (
     "property", "lease", "tenant", "payment", "rent_revision",
     "charge_regularization", "document", "user", "group", "audit_log",
-    "auth",
+    "auth", "procedure",
 )
 
 
